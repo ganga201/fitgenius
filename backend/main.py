@@ -1,6 +1,3 @@
-bashcd /workspaces/fitgenius/backend
-
-cat > main.py << 'ENDOFFILE'
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
