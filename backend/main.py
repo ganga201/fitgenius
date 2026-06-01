@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional
 from dotenv import load_dotenv
 import os
 
@@ -9,7 +10,7 @@ load_dotenv()
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 
-app = FastAPI(title="FitGenius API", version="3.0.0")
+app = FastAPI(title="FitGenius API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,13 +42,12 @@ def detect_intents(query: str) -> list:
                              "heart rate","warm up","cool down"]):
         intents.append("fitness")
 
-    # Default to fitness if nothing detected
     if not intents:
         intents.append("fitness")
 
     return intents
 
-# ── Multi-intent system prompt ─────────────────────────
+# ── System prompt ──────────────────────────────────────
 def build_system_prompt(intents: list) -> str:
 
     strict_rule = """
@@ -58,6 +58,8 @@ CRITICAL RULES:
 4. Do NOT invent food names, supplements, or numbers
    not explicitly in the context.
 5. If context lacks relevant info — say so clearly.
+6. Use the conversation history to maintain context
+   and give consistent, connected answers.
 """
 
     sections = []
@@ -67,10 +69,10 @@ CRITICAL RULES:
 INJURY GUIDELINES:
 - Read context carefully for safe exercises and modifications
 - Clearly state what exercises to AVOID
-- Suggest safe low-impact alternatives if mentioned in context
+- Suggest safe low-impact alternatives if in context
 - Always recommend consulting a physician for persistent pain
-- Mention RICE method (Rest, Ice, Compression, Elevation) if relevant
-- If ANY injury-related content exists in context — USE IT
+- Mention RICE method if relevant
+- If ANY injury-related content exists — USE IT
 """)
 
     if "fitness" in intents:
@@ -79,16 +81,15 @@ FITNESS GUIDELINES:
 - Provide specific exercise recommendations from context
 - Include sets, reps, intensity, frequency if mentioned
 - Reference heart rate zones if relevant
-- Cite specific IFA sections and page numbers
+- Cite specific IFA page numbers
 """)
 
     if "nutrition" in intents:
         sections.append("""
 NUTRITION GUIDELINES:
-- Only cite nutrition facts explicitly stated in context
+- Only cite nutrition facts explicitly in context
 - Do not invent specific foods, brands, or meal plans
 - Reference calorie and protein data only if in context
-- If context lacks specific food lists — say so honestly
 """)
 
     combined = "\n".join(sections)
@@ -99,69 +100,79 @@ NUTRITION GUIDELINES:
 This question involves: {intent_names}
 {combined}
 Address ALL aspects of the member's question.
-Always cite the source (IFA page number) for every fact."""
+Always cite the source (IFA page number) for every fact.
+Use the conversation history to give contextually aware answers."""
 
+# ── Health check ───────────────────────────────────────
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "FitGenius API v3 — multi-intent RAG"
+        "service": "FitGenius API v4 — memory + multi-intent RAG"
     }
+
+# ── Chat request model with history ───────────────────
+class HistoryMessage(BaseModel):
+    role: str      # "user" or "assistant"
+    content: str
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
+    history: Optional[List[HistoryMessage]] = []
 
+# ── Chat endpoint ──────────────────────────────────────
 @app.post("/chat")
 def chat(request: ChatRequest):
     try:
-        # Step 1 — Detect ALL intents
+        # Step 1 — Detect intents
         intents = detect_intents(request.message)
 
-        # Step 2 — Set up embeddings and vectorstore
+        # Step 2 — Set up vectorstore
         embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
         vectorstore = PineconeVectorStore(
             index_name=os.getenv("PINECONE_INDEX_NAME"),
             embedding=embeddings
         )
 
-        # Step 3 — Search Pinecone for each intent separately
-        # Each intent uses a different embedding focus
+        # Step 3 — Build enriched search query using history
+        # Include last user message for better context
+        history_context = ""
+        if request.history:
+            last_messages = request.history[-4:]  # last 4 messages
+            history_context = " ".join([
+                msg.content for msg in last_messages
+                if msg.role == "user"
+            ])
+
+        # Combine current message with recent history for search
+        search_query = f"{request.message} {history_context}".strip()
+
+        # Step 4 — Search Pinecone for each intent
         all_docs = []
         seen_pages = set()
 
         for intent in intents:
-            # Build intent-specific search query
-            # This focuses the embedding on the right aspect
             if intent == "injury":
-                search_query = f"injury safe exercise {request.message}"
-                search_filter = {"category": "fitness"}
-                k = 3
+                focused_query = f"injury safe exercise {search_query}"
             elif intent == "nutrition":
-                search_query = f"nutrition diet {request.message}"
-                # When WHO data added → filter "nutrition"
-                # For now all data is "fitness" so use fitness
-                search_filter = {"category": "fitness"}
-                k = 3
+                focused_query = f"nutrition diet {search_query}"
             else:
-                search_query = f"exercise training {request.message}"
-                search_filter = {"category": "fitness"}
-                k = 3
+                focused_query = f"exercise training {search_query}"
 
             docs = vectorstore.similarity_search(
-                search_query,
-                k=k,
-                filter=search_filter
+                focused_query,
+                k=3,
+                filter={"category": "fitness"}
             )
 
-            # Deduplicate by page number
             for doc in docs:
                 page = doc.metadata.get("page", "")
                 if page not in seen_pages:
                     seen_pages.add(page)
                     all_docs.append(doc)
 
-        # Step 4 — Block if no content found
+        # Step 5 — Block if no content
         if not all_docs:
             return {
                 "response": "I don't have specific information on that "
@@ -172,8 +183,10 @@ def chat(request: ChatRequest):
                 "status": "no_content"
             }
 
-        # Step 5 — Build context from all retrieved chunks
-        context = "\n\n---\n\n".join([doc.page_content for doc in all_docs])
+        # Step 6 — Build IFA context
+        context = "\n\n---\n\n".join([
+            doc.page_content for doc in all_docs
+        ])
 
         if len(context.strip()) < 100:
             return {
@@ -185,21 +198,43 @@ def chat(request: ChatRequest):
                 "status": "insufficient_content"
             }
 
-        # Step 6 — Build multi-intent dynamic prompt
+        # Step 7 — Format conversation history for prompt
+        history_text = ""
+        if request.history and len(request.history) > 0:
+            history_lines = []
+            # Include last 6 messages (3 exchanges)
+            recent_history = request.history[-6:]
+            for msg in recent_history:
+                role = "Member" if msg.role == "user" else "FitGenius"
+                history_lines.append(f"{role}: {msg.content}")
+            history_text = "\n".join(history_lines)
+
+        # Step 8 — Build full prompt with memory
         system_prompt = build_system_prompt(intents)
+
+        # Include history only if it exists
+        history_section = ""
+        if history_text:
+            history_section = f"""
+CONVERSATION HISTORY (use this for context):
+{history_text}
+
+"""
 
         full_prompt = f"""{system_prompt}
 
 CONTEXT FROM IFA FITNESS KNOWLEDGE BASE:
 {context}
 
----
-Member question: {request.message}
+{history_section}---
+Current member question: {request.message}
 
-Provide a complete answer addressing ALL aspects of the question.
-Use ONLY the context above. Cite IFA page numbers for every fact."""
+Provide a complete answer using ONLY the IFA context above.
+Use conversation history to give contextually aware answers.
+If the member mentioned an injury or goal earlier — remember it.
+Cite IFA page numbers for every fact."""
 
-        # Step 7 — Call GPT-4o
+        # Step 9 — Call GPT-4o
         llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0,
@@ -207,7 +242,7 @@ Use ONLY the context above. Cite IFA page numbers for every fact."""
         )
         result = llm.invoke(full_prompt)
 
-        # Step 8 — Extract citations
+        # Step 10 — Extract citations
         sources = []
         for doc in all_docs:
             src = doc.metadata.get("source", "Unknown")
@@ -219,7 +254,7 @@ Use ONLY the context above. Cite IFA page numbers for every fact."""
         return {
             "response": result.content,
             "sources": sources,
-            "intents": intents,        # now returns LIST not single string
+            "intents": intents,
             "status": "success"
         }
 
