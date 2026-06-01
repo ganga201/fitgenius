@@ -9,7 +9,7 @@ load_dotenv()
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 
-app = FastAPI(title="FitGenius API", version="2.0.0")
+app = FastAPI(title="FitGenius API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,63 +19,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def detect_intent(query: str) -> str:
+# ── Multi-intent detection ─────────────────────────────
+def detect_intents(query: str) -> list:
     q = query.lower()
-    if any(w in q for w in ["eat","diet","calorie","protein",
-                             "carb","fat","meal","nutrition","macro",
-                             "food","drink","water","supplement"]):
-        return "nutrition"
-    elif any(w in q for w in ["injury","pain","hurt","knee","shoulder",
-                               "back","surgery","limitation","avoid","safe"]):
-        return "injury"
-    else:
-        return "fitness"
+    intents = []
 
-def build_system_prompt(intent: str) -> str:
+    if any(w in q for w in ["injury","pain","hurt","knee",
+                             "shoulder","back","surgery",
+                             "limitation","avoid","safe","sore"]):
+        intents.append("injury")
+
+    if any(w in q for w in ["eat","diet","calorie","protein",
+                             "carb","fat","meal","nutrition",
+                             "macro","food","drink","supplement",
+                             "weight loss","lose weight"]):
+        intents.append("nutrition")
+
+    if any(w in q for w in ["exercise","workout","cardio","training",
+                             "sets","reps","program","aerobic",
+                             "strength","muscle","fitness","train",
+                             "heart rate","warm up","cool down"]):
+        intents.append("fitness")
+
+    # Default to fitness if nothing detected
+    if not intents:
+        intents.append("fitness")
+
+    return intents
+
+# ── Multi-intent system prompt ─────────────────────────
+def build_system_prompt(intents: list) -> str:
 
     strict_rule = """
 CRITICAL RULES:
 1. ONLY use information from the context provided below.
 2. NEVER use your own training data or internet sources.
 3. Every fact must be traceable to the context.
-4. Do NOT invent food names, supplements, or numbers not in the context.
+4. Do NOT invent food names, supplements, or numbers
+   not explicitly in the context.
+5. If context lacks relevant info — say so clearly.
 """
 
-    if intent == "injury":
-        return f"""{strict_rule}
-You are a certified fitness advisor helping a gym member with an injury.
+    sections = []
 
-INSTRUCTIONS:
-- Read the context carefully for relevant exercises, precautions, or modifications
-- If the context mentions safe exercises or alternatives — share them specifically
-- If the context mentions what to AVOID — share that clearly
-- ALWAYS recommend consulting a physician for serious or persistent pain
-- Prioritize safety above all else
+    if "injury" in intents:
+        sections.append("""
+INJURY GUIDELINES:
+- Read context carefully for safe exercises and modifications
+- Clearly state what exercises to AVOID
+- Suggest safe low-impact alternatives if mentioned in context
+- Always recommend consulting a physician for persistent pain
 - Mention RICE method (Rest, Ice, Compression, Elevation) if relevant
+- If ANY injury-related content exists in context — USE IT
+""")
 
-Only say you lack information if the context is completely unrelated to
-the injury mentioned. If ANY relevant content exists — use it."""
+    if "fitness" in intents:
+        sections.append("""
+FITNESS GUIDELINES:
+- Provide specific exercise recommendations from context
+- Include sets, reps, intensity, frequency if mentioned
+- Reference heart rate zones if relevant
+- Cite specific IFA sections and page numbers
+""")
 
-    elif intent == "nutrition":
-        return f"""{strict_rule}
-You are a certified fitness and nutrition advisor.
-Answer ONLY based on the context provided.
-Do NOT invent specific foods, brands, or supplements not mentioned in context.
-If context lacks specific food lists — say so and share what IS in the context."""
+    if "nutrition" in intents:
+        sections.append("""
+NUTRITION GUIDELINES:
+- Only cite nutrition facts explicitly stated in context
+- Do not invent specific foods, brands, or meal plans
+- Reference calorie and protein data only if in context
+- If context lacks specific food lists — say so honestly
+""")
 
-    else:
-        return f"""{strict_rule}
-You are a certified fitness advisor for a gym.
-Answer ONLY based on the context provided below.
-Be specific and cite the source material.
-If context does not contain relevant information, say:
-"I don't have specific information on that. Please consult a certified professional." """
+    combined = "\n".join(sections)
+    intent_names = ", ".join(intents)
+
+    return f"""You are a certified fitness advisor for a gym.
+{strict_rule}
+This question involves: {intent_names}
+{combined}
+Address ALL aspects of the member's question.
+Always cite the source (IFA page number) for every fact."""
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "FitGenius API v2 — RAG only, no external sources"
+        "service": "FitGenius API v3 — multi-intent RAG"
     }
 
 class ChatRequest(BaseModel):
@@ -85,43 +115,65 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def chat(request: ChatRequest):
     try:
-        # Step 1 — Detect intent
-        intent = detect_intent(request.message)
+        # Step 1 — Detect ALL intents
+        intents = detect_intents(request.message)
 
-        # Step 2 — Retrieve chunks from Pinecone
+        # Step 2 — Set up embeddings and vectorstore
         embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
         vectorstore = PineconeVectorStore(
             index_name=os.getenv("PINECONE_INDEX_NAME"),
             embedding=embeddings
         )
 
-        # For injury — search fitness content
-        # For nutrition — search nutrition content
-        # For general — search fitness content
-        if intent == "nutrition":
-            search_filter = {"category": "nutrition"}
-        else:
-            search_filter = {"category": "fitness"}
+        # Step 3 — Search Pinecone for each intent separately
+        # Each intent uses a different embedding focus
+        all_docs = []
+        seen_pages = set()
 
-        docs = vectorstore.similarity_search(
-            request.message,
-            k=5,
-            filter=search_filter
-        )
+        for intent in intents:
+            # Build intent-specific search query
+            # This focuses the embedding on the right aspect
+            if intent == "injury":
+                search_query = f"injury safe exercise {request.message}"
+                search_filter = {"category": "fitness"}
+                k = 3
+            elif intent == "nutrition":
+                search_query = f"nutrition diet {request.message}"
+                # When WHO data added → filter "nutrition"
+                # For now all data is "fitness" so use fitness
+                search_filter = {"category": "fitness"}
+                k = 3
+            else:
+                search_query = f"exercise training {request.message}"
+                search_filter = {"category": "fitness"}
+                k = 3
 
-        # Step 3 — Block if no content found
-        if not docs:
+            docs = vectorstore.similarity_search(
+                search_query,
+                k=k,
+                filter=search_filter
+            )
+
+            # Deduplicate by page number
+            for doc in docs:
+                page = doc.metadata.get("page", "")
+                if page not in seen_pages:
+                    seen_pages.add(page)
+                    all_docs.append(doc)
+
+        # Step 4 — Block if no content found
+        if not all_docs:
             return {
                 "response": "I don't have specific information on that "
                             "in my current knowledge base. Please consult "
                             "a certified fitness or nutrition professional.",
                 "sources": [],
-                "intent": intent,
+                "intents": intents,
                 "status": "no_content"
             }
 
-        # Step 4 — Build context
-        context = "\n\n---\n\n".join([doc.page_content for doc in docs])
+        # Step 5 — Build context from all retrieved chunks
+        context = "\n\n---\n\n".join([doc.page_content for doc in all_docs])
 
         if len(context.strip()) < 100:
             return {
@@ -129,12 +181,13 @@ def chat(request: ChatRequest):
                             "in my current knowledge base. Please consult "
                             "a certified fitness or nutrition professional.",
                 "sources": [],
-                "intent": intent,
+                "intents": intents,
                 "status": "insufficient_content"
             }
 
-        # Step 5 — Build dynamic prompt
-        system_prompt = build_system_prompt(intent)
+        # Step 6 — Build multi-intent dynamic prompt
+        system_prompt = build_system_prompt(intents)
+
         full_prompt = f"""{system_prompt}
 
 CONTEXT FROM IFA FITNESS KNOWLEDGE BASE:
@@ -143,11 +196,10 @@ CONTEXT FROM IFA FITNESS KNOWLEDGE BASE:
 ---
 Member question: {request.message}
 
-Provide a helpful, specific answer using ONLY the context above.
-If the context contains relevant information — USE IT.
-Cite specific sections or page references where possible."""
+Provide a complete answer addressing ALL aspects of the question.
+Use ONLY the context above. Cite IFA page numbers for every fact."""
 
-        # Step 6 — Call GPT-4o
+        # Step 7 — Call GPT-4o
         llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0,
@@ -155,9 +207,9 @@ Cite specific sections or page references where possible."""
         )
         result = llm.invoke(full_prompt)
 
-        # Step 7 — Extract citations
+        # Step 8 — Extract citations
         sources = []
-        for doc in docs:
+        for doc in all_docs:
             src = doc.metadata.get("source", "Unknown")
             page = doc.metadata.get("page", "")
             citation = f"{src}" + (f", p.{int(page)}" if page else "")
@@ -167,7 +219,7 @@ Cite specific sections or page references where possible."""
         return {
             "response": result.content,
             "sources": sources,
-            "intent": intent,
+            "intents": intents,        # now returns LIST not single string
             "status": "success"
         }
 
@@ -175,6 +227,6 @@ Cite specific sections or page references where possible."""
         return {
             "response": f"Error: {str(e)}",
             "sources": [],
-            "intent": "unknown",
+            "intents": [],
             "status": "error"
         }
