@@ -33,45 +33,43 @@ def detect_intent(query: str) -> str:
 
 def build_system_prompt(intent: str) -> str:
 
-    # This rule is added to EVERY prompt — no exceptions
     strict_rule = """
-CRITICAL RULES — YOU MUST FOLLOW THESE EXACTLY:
-1. You ONLY use information from the context provided below.
-2. You NEVER use your own training data, general knowledge, or internet sources.
-3. You NEVER search Google or any external source.
-4. If the context does not contain enough information to answer the question,
-   you MUST respond with exactly:
-   "I don't have specific information on that in my current knowledge base.
-   Please consult a certified fitness or nutrition professional."
-5. Do NOT make up food names, supplement brands, specific studies, or numbers
-   that are not explicitly stated in the context.
-6. Every fact you state must be traceable to the context provided.
+CRITICAL RULES:
+1. ONLY use information from the context provided below.
+2. NEVER use your own training data or internet sources.
+3. Every fact must be traceable to the context.
+4. Do NOT invent food names, supplements, or numbers not in the context.
 """
 
     if intent == "injury":
         return f"""{strict_rule}
-You are a certified fitness advisor.
-The member has mentioned an injury or physical limitation.
-ALWAYS prioritize safety before recommending any exercise.
-If the condition seems medical, recommend they consult a physician.
-Only use the context provided — never fabricate information."""
+You are a certified fitness advisor helping a gym member with an injury.
+
+INSTRUCTIONS:
+- Read the context carefully for relevant exercises, precautions, or modifications
+- If the context mentions safe exercises or alternatives — share them specifically
+- If the context mentions what to AVOID — share that clearly
+- ALWAYS recommend consulting a physician for serious or persistent pain
+- Prioritize safety above all else
+- Mention RICE method (Rest, Ice, Compression, Elevation) if relevant
+
+Only say you lack information if the context is completely unrelated to
+the injury mentioned. If ANY relevant content exists — use it."""
 
     elif intent == "nutrition":
         return f"""{strict_rule}
 You are a certified fitness and nutrition advisor.
-Answer nutrition questions based ONLY on the context provided below.
-Give specific, practical advice grounded only in the retrieved content.
-If the context does not mention specific foods, brands, or supplements —
-do NOT invent them. Say you don't have that information instead."""
+Answer ONLY based on the context provided.
+Do NOT invent specific foods, brands, or supplements not mentioned in context.
+If context lacks specific food lists — say so and share what IS in the context."""
 
     else:
         return f"""{strict_rule}
 You are a certified fitness advisor for a gym.
-Answer the member's question based ONLY on the context provided below.
-Be specific and practical. Always cite the source material.
-If the context does not contain relevant information, say clearly:
-"I don't have specific information on that in my current knowledge base.
-Please consult a certified fitness professional." """
+Answer ONLY based on the context provided below.
+Be specific and cite the source material.
+If context does not contain relevant information, say:
+"I don't have specific information on that. Please consult a certified professional." """
 
 @app.get("/health")
 def health():
@@ -90,15 +88,20 @@ def chat(request: ChatRequest):
         # Step 1 — Detect intent
         intent = detect_intent(request.message)
 
-        # Step 2 — Retrieve chunks from Pinecone ONLY
+        # Step 2 — Retrieve chunks from Pinecone
         embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
         vectorstore = PineconeVectorStore(
             index_name=os.getenv("PINECONE_INDEX_NAME"),
             embedding=embeddings
         )
 
-        search_filter = {"category": "nutrition"} if intent == "nutrition" \
-                        else {"category": "fitness"}
+        # For injury — search fitness content
+        # For nutrition — search nutrition content
+        # For general — search fitness content
+        if intent == "nutrition":
+            search_filter = {"category": "nutrition"}
+        else:
+            search_filter = {"category": "fitness"}
 
         docs = vectorstore.similarity_search(
             request.message,
@@ -106,7 +109,7 @@ def chat(request: ChatRequest):
             filter=search_filter
         )
 
-        # Step 3 — If no relevant chunks found — block immediately
+        # Step 3 — Block if no content found
         if not docs:
             return {
                 "response": "I don't have specific information on that "
@@ -117,13 +120,10 @@ def chat(request: ChatRequest):
                 "status": "no_content"
             }
 
-        # Step 4 — Build context from retrieved chunks ONLY
+        # Step 4 — Build context
         context = "\n\n---\n\n".join([doc.page_content for doc in docs])
 
-        # Step 5 — Check if context is actually relevant
-        # If chunks are too short or clearly irrelevant, block
-        total_context_length = len(context.strip())
-        if total_context_length < 100:
+        if len(context.strip()) < 100:
             return {
                 "response": "I don't have specific information on that "
                             "in my current knowledge base. Please consult "
@@ -133,30 +133,29 @@ def chat(request: ChatRequest):
                 "status": "insufficient_content"
             }
 
-        # Step 6 — Build strict dynamic prompt
+        # Step 5 — Build dynamic prompt
         system_prompt = build_system_prompt(intent)
         full_prompt = f"""{system_prompt}
 
-CONTEXT FROM IFA FITNESS KNOWLEDGE BASE ONLY:
+CONTEXT FROM IFA FITNESS KNOWLEDGE BASE:
 {context}
 
 ---
 Member question: {request.message}
 
-Answer using ONLY the context above. 
-If the context does not directly address this question, say so:"""
+Provide a helpful, specific answer using ONLY the context above.
+If the context contains relevant information — USE IT.
+Cite specific sections or page references where possible."""
 
-        # Step 7 — Call GPT-4o with strict instructions
+        # Step 6 — Call GPT-4o
         llm = ChatOpenAI(
             model="gpt-4o",
-            temperature=0,        # 0 = most factual, least creative
-            model_kwargs={
-                "seed": 42        # consistent responses
-            }
+            temperature=0,
+            model_kwargs={"seed": 42}
         )
         result = llm.invoke(full_prompt)
 
-        # Step 8 — Extract citations
+        # Step 7 — Extract citations
         sources = []
         for doc in docs:
             src = doc.metadata.get("source", "Unknown")
