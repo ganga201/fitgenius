@@ -1,3 +1,6 @@
+bashcd /workspaces/fitgenius/backend
+
+cat > main.py << 'ENDOFFILE'
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,7 +13,7 @@ load_dotenv()
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 
-app = FastAPI(title="FitGenius API", version="4.0.0")
+app = FastAPI(title="FitGenius API", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,8 +61,19 @@ CRITICAL RULES:
 4. Do NOT invent food names, supplements, or numbers
    not explicitly in the context.
 5. If context lacks relevant info — say so clearly.
-6. Use the conversation history to maintain context
-   and give consistent, connected answers.
+6. Use conversation history SILENTLY — NEVER reference it
+   explicitly. Do NOT say phrases like:
+   "based on our previous conversation"
+   "as mentioned earlier"
+   "based on the previous conversation"
+   "as you mentioned before"
+   "from our earlier discussion"
+   "you previously mentioned"
+   Simply remember and USE the context naturally.
+   Respond like a human trainer who naturally remembers
+   what was discussed — without announcing that they remember.
+   Just give the answer directly using what you know from
+   the conversation so far.
 """
 
     sections = []
@@ -71,8 +85,10 @@ INJURY GUIDELINES:
 - Clearly state what exercises to AVOID
 - Suggest safe low-impact alternatives if in context
 - Always recommend consulting a physician for persistent pain
-- Mention RICE method if relevant
+- Mention RICE method (Rest, Ice, Compression, Elevation) if relevant
 - If ANY injury-related content exists — USE IT
+- Be empathetic and helpful — don't just say "stop exercising"
+  Give them alternatives they CAN do safely
 """)
 
     if "fitness" in intents:
@@ -82,6 +98,7 @@ FITNESS GUIDELINES:
 - Include sets, reps, intensity, frequency if mentioned
 - Reference heart rate zones if relevant
 - Cite specific IFA page numbers
+- Be practical and specific — not generic
 """)
 
     if "nutrition" in intents:
@@ -90,30 +107,32 @@ NUTRITION GUIDELINES:
 - Only cite nutrition facts explicitly in context
 - Do not invent specific foods, brands, or meal plans
 - Reference calorie and protein data only if in context
+- If context lacks specific food lists — say so honestly
 """)
 
     combined = "\n".join(sections)
     intent_names = ", ".join(intents)
 
-    return f"""You are a certified fitness advisor for a gym.
+    return f"""You are FitGenius — a certified fitness advisor for a gym.
+You speak naturally, warmly, and directly like a knowledgeable personal trainer.
 {strict_rule}
 This question involves: {intent_names}
 {combined}
 Address ALL aspects of the member's question.
-Always cite the source (IFA page number) for every fact.
-Use the conversation history to give contextually aware answers."""
+Always cite the IFA source and page number for every fact.
+Be conversational — not robotic. Get straight to the answer."""
 
 # ── Health check ───────────────────────────────────────
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "FitGenius API v4 — memory + multi-intent RAG"
+        "service": "FitGenius API v4.1 — silent memory + multi-intent"
     }
 
-# ── Chat request model with history ───────────────────
+# ── Request models ─────────────────────────────────────
 class HistoryMessage(BaseModel):
-    role: str      # "user" or "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
@@ -136,16 +155,14 @@ def chat(request: ChatRequest):
         )
 
         # Step 3 — Build enriched search query using history
-        # Include last user message for better context
         history_context = ""
         if request.history:
-            last_messages = request.history[-4:]  # last 4 messages
-            history_context = " ".join([
-                msg.content for msg in last_messages
+            last_user_messages = [
+                msg.content for msg in request.history[-4:]
                 if msg.role == "user"
-            ])
+            ]
+            history_context = " ".join(last_user_messages)
 
-        # Combine current message with recent history for search
         search_query = f"{request.message} {history_context}".strip()
 
         # Step 4 — Search Pinecone for each intent
@@ -172,7 +189,7 @@ def chat(request: ChatRequest):
                     seen_pages.add(page)
                     all_docs.append(doc)
 
-        # Step 5 — Block if no content
+        # Step 5 — Block if no content found
         if not all_docs:
             return {
                 "response": "I don't have specific information on that "
@@ -198,25 +215,23 @@ def chat(request: ChatRequest):
                 "status": "insufficient_content"
             }
 
-        # Step 7 — Format conversation history for prompt
+        # Step 7 — Format conversation history
         history_text = ""
         if request.history and len(request.history) > 0:
             history_lines = []
-            # Include last 6 messages (3 exchanges)
             recent_history = request.history[-6:]
             for msg in recent_history:
                 role = "Member" if msg.role == "user" else "FitGenius"
                 history_lines.append(f"{role}: {msg.content}")
             history_text = "\n".join(history_lines)
 
-        # Step 8 — Build full prompt with memory
+        # Step 8 — Build full prompt
         system_prompt = build_system_prompt(intents)
 
-        # Include history only if it exists
         history_section = ""
         if history_text:
             history_section = f"""
-CONVERSATION HISTORY (use this for context):
+CONVERSATION SO FAR (use silently for context — do not reference explicitly):
 {history_text}
 
 """
@@ -227,12 +242,9 @@ CONTEXT FROM IFA FITNESS KNOWLEDGE BASE:
 {context}
 
 {history_section}---
-Current member question: {request.message}
+Member: {request.message}
 
-Provide a complete answer using ONLY the IFA context above.
-Use conversation history to give contextually aware answers.
-If the member mentioned an injury or goal earlier — remember it.
-Cite IFA page numbers for every fact."""
+FitGenius:"""
 
         # Step 9 — Call GPT-4o
         llm = ChatOpenAI(
