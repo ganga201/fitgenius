@@ -218,7 +218,7 @@ export default function Home() {
               </div>
             </div>
             {/* Clerk UserButton — shows avatar, sign out, profile */}
-            <UserButton afterSignOutUrl="/sign-in" />
+            <UserButton afterSignOutUrl= />
           </div>
         </header>
 
