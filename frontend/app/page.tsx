@@ -1,6 +1,7 @@
 'use client'
 import { useState, useRef, useEffect } from 'react'
-import { useUser, UserButton } from '@clerk/nextjs'
+import { useRouter } from 'next/navigation'
+import { supabase } from '../lib/supabase'
 import axios from 'axios'
 
 interface Message {
@@ -24,81 +25,84 @@ const INTENT_CONFIG: Record<string, { label: string; color: string; bg: string }
 }
 
 export default function Home() {
-  const { user, isLoaded } = useUser()
+  const router = useRouter()
+  const [user, setUser] = useState<any>(null)
+  const [authLoading, setAuthLoading] = useState(true)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [quota, setQuota] = useState<number | null>(null)
-  const [quotaMax, setQuotaMax] = useState(30)
+  const [quota, setQuota] = useState<number>(30)
+  const [quotaMax] = useState(30)
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) {
+        router.push('/login')
+      } else {
+        setUser(session.user)
+        fetchQuota(session.user.id)
+      }
+      setAuthLoading(false)
+    })
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        if (event === 'SIGNED_OUT') {
+          router.push('/login')
+        } else if (session) {
+          setUser(session.user)
+        }
+      }
+    )
+    return () => subscription.unsubscribe()
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
 
-  // Fetch current quota when user loads
-  useEffect(() => {
-    if (user?.id) {
-      fetchQuota()
-    }
-  }, [user?.id])
-
-  async function fetchQuota() {
+  async function fetchQuota(userId: string) {
     try {
       const res = await axios.get(
-        `${process.env.NEXT_PUBLIC_API_URL}/quota/${user?.id}`
+        `${process.env.NEXT_PUBLIC_API_URL}/quota/${userId}`
       )
       setQuota(res.data.remaining)
-      setQuotaMax(res.data.limit)
     } catch {
-      setQuota(30) // fallback
+      setQuota(30)
     }
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut()
+    router.push('/login')
   }
 
   async function sendMessage(text?: string) {
     const userMessage = (text || input).trim()
-    if (!userMessage || loading || quota === 0 || !user?.id) return
-
+    if (!userMessage || loading || quota === 0 || !user) return
     setInput('')
     setLoading(true)
-
-    const newMessages: Message[] = [...messages, {
-      role: 'user', content: userMessage
-    }]
+    const newMessages: Message[] = [...messages, { role: 'user', content: userMessage }]
     setMessages(newMessages)
-
-    const history = messages.slice(1).slice(-6).map(m => ({
-      role: m.role, content: m.content
-    }))
-
+    const history = messages.slice(1).slice(-6).map(m => ({ role: m.role, content: m.content }))
     try {
       const res = await axios.post(
         `${process.env.NEXT_PUBLIC_API_URL}/chat`,
-        {
-          message: userMessage,
-          user_id: user.id,        // ← real Clerk user ID
-          session_id: user.id,     // ← same for quota tracking
-          history
-        }
+        { message: userMessage, user_id: user.id, session_id: user.id, history }
       )
-
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: res.data.response,
         sources: res.data.sources || [],
         intents: res.data.intents || []
       }])
-
-      // Update quota from backend response
-      if (res.data.quota_remaining !== undefined) {
-        setQuota(res.data.quota_remaining)
-      }
-
+      if (res.data.quota_remaining !== undefined) setQuota(res.data.quota_remaining)
     } catch (e: any) {
       if (e.response?.status === 429) {
         setMessages(prev => [...prev, {
           role: 'assistant',
-          content: 'You have used all your questions for this period. Please contact your gym to continue.',
+          content: 'You have used all your questions for this period. Please contact your gym.',
           sources: [], intents: []
         }])
         setQuota(0)
@@ -114,26 +118,19 @@ export default function Home() {
   }
 
   function handleKey(e: React.KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendMessage()
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   }
 
-  const quotaNum = quota ?? 30
-  const quotaPct = (quotaNum / quotaMax) * 100
+  const quotaPct = (quota / quotaMax) * 100
   const quotaHue = Math.round((quotaPct / 100) * 120)
 
-  // Show loading while Clerk initializes
-  if (!isLoaded) {
+  if (authLoading) {
     return (
       <div style={{
         height: '100vh', background: '#0a0a0f',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        color: 'rgba(255,255,255,0.4)', fontFamily: 'sans-serif'
-      }}>
-        Loading...
-      </div>
+        color: 'rgba(255,255,255,0.4)', fontFamily: 'sans-serif', fontSize: '14px'
+      }}>Loading...</div>
     )
   }
 
@@ -154,14 +151,17 @@ export default function Home() {
         .quota-area { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
         .quota-label { font-size: 11px; color: rgba(255,255,255,0.4); font-weight: 300; }
         .quota-bar-wrap { width: 100px; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; }
-        .quota-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease, background 0.5s ease; }
+        .quota-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+        .signout-btn { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 12px; color: rgba(255,255,255,0.5); font-size: 12px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.2s; }
+        .signout-btn:hover { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.8); }
+        .user-email { font-size: 11px; color: rgba(255,255,255,0.3); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .messages { flex: 1; overflow-y: auto; padding: 24px 28px; display: flex; flex-direction: column; gap: 20px; position: relative; z-index: 1; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.08) transparent; }
         .hero { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 16px; text-align: center; padding: 40px 20px; animation: fadeUp 0.6s ease both; }
         @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
         .hero-icon { width: 72px; height: 72px; border-radius: 20px; background: linear-gradient(135deg, #6366f1, #8b5cf6); display: flex; align-items: center; justify-content: center; font-size: 36px; box-shadow: 0 0 40px rgba(99,102,241,0.35); margin-bottom: 8px; }
         .hero-title { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 32px; letter-spacing: -1px; background: linear-gradient(135deg, #fff 40%, #a5b4fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .hero-sub { font-size: 15px; color: rgba(255,255,255,0.4); max-width: 380px; line-height: 1.6; font-weight: 300; }
-        .hero-user { font-size: 14px; color: rgba(255,255,255,0.5); }
+        .hero-user { font-size: 13px; color: rgba(255,255,255,0.3); }
         .hero-user span { color: #a5b4fc; font-weight: 500; }
         .suggestions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; width: 100%; max-width: 560px; margin-top: 16px; }
         .suggestion-btn { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px 16px; font-size: 13px; color: rgba(255,255,255,0.6); cursor: pointer; text-align: left; transition: all 0.2s ease; font-family: 'DM Sans', sans-serif; line-height: 1.4; }
@@ -177,7 +177,7 @@ export default function Home() {
         .bubble.user { background: linear-gradient(135deg, #6366f1, #7c3aed); color: #fff; border-bottom-right-radius: 4px; }
         .bubble.bot { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); color: rgba(255,255,255,0.88); border-bottom-left-radius: 4px; }
         .sources-area { padding: 10px 14px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; font-size: 12px; }
-        .sources-label { color: rgba(255,255,255,0.3); font-weight: 500; margin-bottom: 6px; letter-spacing: 0.3px; }
+        .sources-label { color: rgba(255,255,255,0.3); font-weight: 500; margin-bottom: 6px; }
         .sources-chips { display: flex; flex-wrap: wrap; gap: 6px; }
         .source-chip { padding: 3px 10px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); border-radius: 20px; color: #a5b4fc; font-size: 11px; }
         .intent-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
@@ -196,7 +196,7 @@ export default function Home() {
         .send-btn { width: 38px; height: 38px; border-radius: 10px; background: linear-gradient(135deg, #6366f1, #7c3aed); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s ease; box-shadow: 0 0 16px rgba(99,102,241,0.35); }
         .send-btn:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 0 24px rgba(99,102,241,0.5); }
         .send-btn:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
-        .input-footer { text-align: center; font-size: 11px; color: rgba(255,255,255,0.18); margin-top: 10px; letter-spacing: 0.3px; }
+        .input-footer { text-align: center; font-size: 11px; color: rgba(255,255,255,0.18); margin-top: 10px; }
         .quota-banner { padding: 12px 28px; background: rgba(239,68,68,0.08); border-top: 1px solid rgba(239,68,68,0.2); text-align: center; font-size: 13px; color: #f87171; }
       `}</style>
 
@@ -211,14 +211,16 @@ export default function Home() {
           </div>
           <div className="header-right">
             <div className="quota-area">
-              <div className="quota-label">{quotaNum}/{quotaMax} questions</div>
+              <div className="quota-label">{quota}/{quotaMax} questions</div>
               <div className="quota-bar-wrap">
                 <div className="quota-bar-fill"
                   style={{ width: `${quotaPct}%`, background: `hsl(${quotaHue}, 80%, 55%)` }} />
               </div>
             </div>
-            {/* Clerk UserButton — shows avatar, sign out, profile */}
-            <UserButton />
+            <div style={{ textAlign: 'right' }}>
+              <div className="user-email">{user?.email}</div>
+              <button className="signout-btn" onClick={signOut}>Sign out</button>
+            </div>
           </div>
         </header>
 
@@ -227,18 +229,11 @@ export default function Home() {
             <div className="hero">
               <div className="hero-icon">🏋️</div>
               <div className="hero-title">FitGenius</div>
-              <div className="hero-sub">
-                Your certified fitness advisor — powered by IFA guidelines.
-              </div>
-              {user && (
-                <div className="hero-user">
-                  Welcome back, <span>{user.firstName || user.emailAddresses[0]?.emailAddress}</span>
-                </div>
-              )}
+              <div className="hero-sub">Your certified fitness advisor — powered by IFA guidelines.</div>
+              <div className="hero-user">Welcome, <span>{user?.email}</span></div>
               <div className="suggestions-grid">
                 {SUGGESTIONS.map((s, i) => (
-                  <button key={i} className="suggestion-btn"
-                    onClick={() => sendMessage(s)}>{s}</button>
+                  <button key={i} className="suggestion-btn" onClick={() => sendMessage(s)}>{s}</button>
                 ))}
               </div>
             </div>
@@ -250,16 +245,12 @@ export default function Home() {
                 {msg.role === 'user' ? '👤' : '🤖'}
               </div>
               <div className="bubble-wrap">
-                <div className={`bubble ${msg.role === 'user' ? 'user' : 'bot'}`}>
-                  {msg.content}
-                </div>
+                <div className={`bubble ${msg.role === 'user' ? 'user' : 'bot'}`}>{msg.content}</div>
                 {msg.sources && msg.sources.length > 0 && (
                   <div className="sources-area">
                     <div className="sources-label">📖 Sources</div>
                     <div className="sources-chips">
-                      {msg.sources.map((src, j) => (
-                        <span key={j} className="source-chip">{src}</span>
-                      ))}
+                      {msg.sources.map((src, j) => <span key={j} className="source-chip">{src}</span>)}
                     </div>
                   </div>
                 )}
@@ -267,12 +258,7 @@ export default function Home() {
                   <div className="intent-chips">
                     {msg.intents.map((intent, k) => {
                       const cfg = INTENT_CONFIG[intent] || INTENT_CONFIG.fitness
-                      return (
-                        <span key={k} className="intent-chip" style={{
-                          color: cfg.color, background: cfg.bg,
-                          borderColor: cfg.color + '33'
-                        }}>{cfg.label}</span>
-                      )
+                      return <span key={k} className="intent-chip" style={{ color: cfg.color, background: cfg.bg, borderColor: cfg.color + '33' }}>{cfg.label}</span>
                     })}
                   </div>
                 )}
@@ -292,10 +278,7 @@ export default function Home() {
         </div>
 
         {quota === 0 && (
-          <div className="quota-banner">
-            ⚠️ You've used all {quotaMax} questions for this period.
-            Contact your gym to continue.
-          </div>
+          <div className="quota-banner">⚠️ You've used all {quotaMax} questions. Contact your gym.</div>
         )}
 
         <div className="input-area">
@@ -305,26 +288,18 @@ export default function Home() {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKey}
-              placeholder={
-                quota === 0
-                  ? 'Quota exhausted — contact your gym'
-                  : 'Ask about fitness, nutrition, or injuries...'
-              }
+              placeholder={quota === 0 ? 'Quota exhausted' : 'Ask about fitness, nutrition, or injuries...'}
               disabled={loading || quota === 0}
               rows={1}
             />
-            <button className="send-btn"
-              onClick={() => sendMessage()}
+            <button className="send-btn" onClick={() => sendMessage()}
               disabled={loading || !input.trim() || quota === 0}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path d="M22 2L11 13M22 2L15 22L11 13M11 13L2 9L22 2"
-                  stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M22 2L11 13M22 2L15 22L11 13M11 13L2 9L22 2" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
             </button>
           </div>
-          <div className="input-footer">
-            Answers grounded in IFA Fitness ABCs certified guidelines only
-          </div>
+          <div className="input-footer">Answers grounded in IFA Fitness ABCs certified guidelines only</div>
         </div>
       </div>
     </>
